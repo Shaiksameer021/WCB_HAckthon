@@ -21,6 +21,60 @@ function sendJson(res, status, data) {
     res.end(JSON.stringify(data));
 }
 
+/**
+ * Sleep for ms milliseconds.
+ */
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Call the Gemini API with exponential backoff retry.
+ * Retries on 503 (service unavailable / high demand) and 429 (rate limit).
+ * Base delay: 1s → 2s → 4s → 8s (jitter ±20%).
+ */
+async function callGeminiWithRetry(url, payload, maxRetries = 4) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (attempt > 0) {
+            const baseDelay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+            const jitter = baseDelay * 0.2 * (Math.random() * 2 - 1);
+            const delay = Math.round(baseDelay + jitter);
+            console.log(`[BrandMind] Gemini retry attempt ${attempt}/${maxRetries} in ${delay}ms...`);
+            await sleep(delay);
+        }
+
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': GEMINI_API_KEY
+                },
+                body: JSON.stringify(payload)
+            });
+
+            // These status codes are retryable
+            if (response.status === 503 || response.status === 429) {
+                const errData = await response.json().catch(() => ({}));
+                const msg = errData?.error?.message || `HTTP ${response.status}`;
+                lastError = new Error(msg);
+                console.warn(`[BrandMind] Gemini ${response.status} on attempt ${attempt}: ${msg}`);
+                continue; // retry
+            }
+
+            return response; // success or non-retryable error — caller handles it
+        } catch (err) {
+            // Network-level errors (fetch failed, ECONNRESET, etc.) — also retryable
+            lastError = err;
+            console.warn(`[BrandMind] Gemini fetch error on attempt ${attempt}:`, err.message);
+        }
+    }
+
+    throw lastError || new Error('All Gemini retry attempts exhausted.');
+}
+
 function getContentType(filePath) {
     const ext = path.extname(filePath).toLowerCase();
 
@@ -71,40 +125,31 @@ async function handleGemini(req, res) {
             const url =
                 `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-goog-api-key': GEMINI_API_KEY
-                },
-                body: JSON.stringify({
-                    contents: [
-                        {
-                            role: 'user',
-                            parts: [
-                                {
-                                    text: prompt
-                                }
-                            ]
-                        }
-                    ],
-                    generationConfig: {
-                        responseMimeType: 'application/json',
-                        temperature: 0.6,
-                        maxOutputTokens: 8192
+            const payload = {
+                contents: [
+                    {
+                        role: 'user',
+                        parts: [{ text: prompt }]
                     }
-                })
-            });
+                ],
+                generationConfig: {
+                    // NOTE: No responseMimeType — gemini-2.5-flash is a thinking
+                    // model and returns empty if this key is present.
+                    // JSON is extracted from the text output below.
+                    temperature: 0.6,
+                    maxOutputTokens: 16384
+                }
+            };
+
+            // Use retry wrapper — handles 503 "high demand" and 429 rate limits
+            const response = await callGeminiWithRetry(url, payload);
 
             const data = await response.json();
 
             if (!response.ok) {
                 console.error('Gemini error:', data);
-
                 return sendJson(res, response.status, {
-                    error:
-                        data?.error?.message ||
-                        'Gemini API request failed.'
+                    error: data?.error?.message || 'Gemini API request failed.'
                 });
             }
 
@@ -122,22 +167,25 @@ async function handleGemini(req, res) {
             let result;
 
             try {
-                result = JSON.parse(text);
+                // Thinking models may wrap output in markdown code fences — strip them
+                const cleaned = text
+                    .replace(/^```json\s*/i, '')
+                    .replace(/^```\s*/i, '')
+                    .replace(/```\s*$/i, '')
+                    .trim();
+                result = JSON.parse(cleaned);
             } catch {
+                // Fallback: find first {...} block in the raw text
                 const match = text.match(/\{[\s\S]*\}/);
-
                 if (!match) {
                     return sendJson(res, 502, {
                         error: 'Gemini returned invalid JSON.'
                     });
                 }
-
                 result = JSON.parse(match[0]);
             }
 
-            return sendJson(res, 200, {
-                result
-            });
+            return sendJson(res, 200, { result });
 
         } catch (error) {
             console.error('Backend error:', error);
